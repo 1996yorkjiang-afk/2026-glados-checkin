@@ -31,11 +31,10 @@ DOMAINS = [
     "https://glados.network",
 ]
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Content-Type': 'application/json;charset=UTF-8',
-    'Accept': 'application/json, text/plain, */*',
-}
+DEFAULT_USER_AGENT = (
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36'
+)
 
 # ================= 工具函数 =================
 
@@ -71,15 +70,15 @@ def get_cookies():
         log("❌ 未配置 GLADOS_COOKIE")
         return []
     
-    # Split by enter or &
-    sep = '\n' if '\n' in raw else '&'
-    return [extract_cookie(c) for c in raw.split(sep) if c.strip()]
+    # 多账号只使用 & 分隔；Cookie 内换行不应被误判成多个账号。
+    return [extract_cookie(c.replace('\n', ' ')) for c in raw.split('&') if c.strip()]
 
 # ================= 核心逻辑 =================
 
 class GLaDOS:
     def __init__(self, cookie):
         self.cookie = cookie
+        self.user_agent = os.environ.get("GLADOS_USER_AGENT", DEFAULT_USER_AGENT).strip()
         self.domain = DOMAINS[0]
         self.email = "?"
         self.left_days = "?"
@@ -93,15 +92,22 @@ class GLaDOS:
         for d in DOMAINS:
             try:
                 url = f"{d}{path}"
-                h = HEADERS.copy()
-                h['Cookie'] = self.cookie
-                h['Origin'] = d
-                h['Referer'] = f"{d}/console/checkin"
+                h = {
+                    'User-Agent': self.user_agent,
+                    'Accept': 'application/json, text/plain, */*',
+                    'Cookie': self.cookie,
+                    'Origin': d,
+                }
                 
                 if method == 'GET':
                     resp = requests.get(url, headers=h, timeout=10)
                 else:
-                    resp = requests.post(url, headers=h, json=data, timeout=10)
+                    h['Content-Type'] = 'application/json;charset=UTF-8'
+                    payload = dict(data or {})
+                    if path == '/api/user/checkin':
+                        payload['token'] = d.removeprefix('https://')
+                    body = json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+                    resp = requests.post(url, headers=h, data=body, timeout=10)
                 
                 if resp.status_code == 200:
                     self.domain = d # Remember working domain
@@ -227,16 +233,24 @@ def main():
         # 1. Checkin
         res = g.checkin()
         msg = res.get('message', 'Failure') if res else "Network Error"
+        code = res.get('code') if res else None
+        checkin_ok = code in (0, 1)
         
         # 2. Get Info (Refresh data)
         g.get_status()
         g.get_points()
         
         # 3. Log
-        status_icon = "✅" if "Checkin" in msg else "⚠️"
         log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg}")
+        if code == 4:
+            details = ", ".join(
+                f"{key}={res[key]}"
+                for key in ("reason", "loginDevice", "currentDevice")
+                if res.get(key)
+            )
+            log(f"❌ 签到请求与登录设备不一致{f' ({details})' if details else ''}，请更新 GLADOS_USER_AGENT")
         
-        if "Checkin" in msg: success_cnt += 1
+        if checkin_ok: success_cnt += 1
         
         # 4. Result Formatting
         results.append(f"""
@@ -258,7 +272,7 @@ def main():
     
     if push_level == "fail_only" and success_cnt == len(cookies):
         log("⏭️ 根据 PUSH_LEVEL=fail_only 设置，所有账号签到成功，跳过推送")
-        return
+        return 0
 
     ptoken = os.environ.get("PUSHPLUS_TOKEN")
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -274,5 +288,7 @@ def main():
         if tg_token and tg_chat_id:
             telegram_push(tg_token, tg_chat_id, title, content)
 
+    return 0 if success_cnt == len(cookies) else 1
+
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
